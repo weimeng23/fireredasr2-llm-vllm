@@ -180,6 +180,24 @@ python3 examples/client.py a.wav b.wav --uttid audio_001 --uttid audio_002 --for
 
 单文件也可以使用 [OpenAI SDK 示例](examples/openai_client.py)，安装 `openai` 后运行。通过 `ASR_BASE_URL` 指定服务地址，裸 PCM 使用 `--audio-format pcm`，音频 ID 使用 `--uttid`。该示例读取原始 JSON 响应以支持网关的统一结构；直连 vLLM 仍返回原生格式。批量上传使用上述标准库客户端或 curl。
 
+## 接口压测
+
+[benchmark.py](examples/benchmark.py) 无需额外安装依赖，支持单条、batch 和多档并发压测。在项目根目录执行：
+
+```bash
+python3 examples/benchmark.py \
+  --url http://127.0.0.1:12345/v1/audio/transcriptions \
+  --manifest examples/example_manifest.jsonl \
+  --concurrency 1 4 8 16 32 \
+  --request-batch-size 1 2 \
+  --requests 100 \
+  --output benchmark.json
+```
+
+按[示例清单](examples/example_manifest.jsonl)准备音频，相对路径以清单目录为基准；也可用 `--audio a.wav b.wav` 替代 `--manifest`。鉴权读取 `ASR_API_KEY`。
+
+上述命令测试 5 档 HTTP 并发 × 2 档 batch，每组 100 个请求，另有默认 3 次预热。报告统计成功率、音频吞吐及 P50/P95/P99 延迟，部分失败也计入错误。更多参数见 `--help`。
+
 ## 服务管理
 
 ```bash
