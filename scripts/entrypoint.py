@@ -12,6 +12,8 @@ import urllib.request
 from pathlib import Path
 
 from serve import build_command, log_command
+from service_port import DEFAULT_PORT, HEALTH_PORT_FILE, port_number
+from env_file import read_env_file
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,7 +78,8 @@ def supervise(backend_command, gateway_command, *, gateway_env, health_url,
         gateway = subprocess.Popen(gateway_command, cwd=ROOT, env=gateway_env,
                                    start_new_session=True)
         processes.append(gateway)
-        print("vLLM ready; starting WebRTC VAD gateway on :8000", flush=True)
+        print("vLLM ready; starting WebRTC VAD gateway", flush=True)
+        log_command(gateway_command)
         while not stopping.wait(0.25):
             for name, process in (("vLLM", backend), ("gateway", gateway)):
                 if process.poll() is not None:
@@ -91,24 +94,35 @@ def supervise(backend_command, gateway_command, *, gateway_env, health_url,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", choices=("vllm", "all"))
+    parser.add_argument("--env-file", type=Path,
+                        help="Container-local KEY=VALUE file; overrides existing environment variables")
+    parser.add_argument("--port", type=port_number,
+                        help="Public listening port (overrides SERVICE_PORT; default: 8000)")
     args = parser.parse_args()
+    if args.env_file is not None:
+        os.environ.update(read_env_file(args.env_file))
     mode = args.mode or os.getenv("SERVICE_MODE", "vllm")
+    port = args.port if args.port is not None else port_number(os.getenv("SERVICE_PORT", str(DEFAULT_PORT)))
     if mode not in ("vllm", "all"):
         raise ValueError("SERVICE_MODE must be vllm or all")
+    if mode == "all" and port == 8001:
+        parser.error("Port 8001 is reserved for the internal vLLM backend in all mode")
     startup = positive_seconds("STARTUP_TIMEOUT_SECONDS", "900")
     shutdown = positive_seconds("SHUTDOWN_TIMEOUT_SECONDS", "25")
     if mode == "vllm":
         # ASR_API_KEY is the public API key in either mode.
         if not os.getenv("BACKEND_API_KEY") and os.getenv("ASR_API_KEY"):
             os.environ["BACKEND_API_KEY"] = os.environ["ASR_API_KEY"]
-        command = build_command()
+        command = build_command(port=port)
+        HEALTH_PORT_FILE.write_text(str(port), encoding="ascii")
         log_command(command)
         os.execvp(command[0], command)
     backend = build_command(host="127.0.0.1", port=8001)
+    HEALTH_PORT_FILE.write_text(str(port), encoding="ascii")
     gateway_env = dict(os.environ, BACKEND_URL="http://127.0.0.1:8001")
     gateway_python = os.getenv("GATEWAY_PYTHON", "/opt/gateway-venv/bin/python")
     gateway = [gateway_python, "-m", "uvicorn", "gateway.app:app",
-               "--host", "0.0.0.0", "--port", "8000", "--workers", "1",
+               "--host", "0.0.0.0", "--port", str(port), "--workers", "1",
                "--timeout-graceful-shutdown", str(max(1, int(shutdown) - 2))]
     log_command(backend)
     return supervise(backend, gateway, gateway_env=gateway_env,

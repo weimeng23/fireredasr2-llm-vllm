@@ -36,9 +36,26 @@ docker run -d \
   fireredasr2-vllm:0.29.0
 ```
 
-仅运行 vLLM 时，将 `SERVICE_MODE=all` 改为 `SERVICE_MODE=vllm`。两种模式均通过容器端口 `8000` 提供服务；网关模式的 vLLM 后端仅监听容器内部 `127.0.0.1:8001`。
+仅运行 vLLM 时，将 `SERVICE_MODE=all` 改为 `SERVICE_MODE=vllm`。两种模式默认通过容器端口 `8000` 提供服务；网关模式的 vLLM 后端仅监听容器内部 `127.0.0.1:8001`。
 
 需要从其他机器访问时，将端口映射改为 `-p 8000:8000`。切换模式前，先停止并删除同名容器。
+
+平台只允许配置启动命令（CMD）时，可直接指定运行模式和容器监听端口。例如网关监听 `12345`：
+
+```bash
+python3 /opt/fireredasr2-vllm/scripts/entrypoint.py all --port 12345
+```
+
+如果平台将命令和参数分开填写，命令填 `python3`，参数依次填 `/opt/fireredasr2-vllm/scripts/entrypoint.py`、`all`、`--port`、`12345`。已有完整默认 CMD 的情况下，只需在末尾追加 `all --port 12345`。健康检查自动使用所选端口，平台的服务端口配置也应指向 `12345`。仅运行 vLLM 时将 `all` 改为 `vllm`；`all` 模式下 `8001` 保留给内部后端，不能作为网关端口。
+
+也可以通过 CMD 的 `--env-file` 加载配置。例如镜像附带的模板：
+
+```bash
+python3 /opt/fireredasr2-vllm/scripts/entrypoint.py \
+  --env-file /opt/fireredasr2-vllm/.env.example all --port 12345
+```
+
+自定义文件必须在容器内可读，可由平台挂载，或在构建镜像时复制非敏感配置；宿主机上的文件不会自动可见。配置可写 `SERVICE_MODE=all`、`SERVICE_PORT=12345` 及其他参数，这样 CMD 只需指定 `--env-file /容器内路径/.env`。每行使用 `KEY=VALUE`，值不加引号，注释独立成行；不执行 shell 或展开变量。配置优先级为：CMD 的模式及端口参数 > 配置文件 > 已有环境变量 > 代码默认值。API 密钥等敏感配置应通过平台运行时挂载的文件提供，不应写入镜像。如果由平台环境变量注入密钥，应从配置文件删除对应项，避免被文件中的值覆盖。
 
 ## 转写接口
 

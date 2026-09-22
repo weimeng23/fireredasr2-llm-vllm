@@ -31,6 +31,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     && uv pip check --python /opt/gateway-venv/bin/python
 COPY scripts ./scripts
 COPY gateway ./gateway
+COPY .env.example ./.env.example
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 ENV PYTHONUNBUFFERED=1 SERVICE_MODE=vllm
 EXPOSE 8000
