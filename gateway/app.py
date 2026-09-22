@@ -4,18 +4,21 @@ import hmac
 import io
 import logging
 import math
+import multiprocessing
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .audio import AudioError, cut_wav, join_text, prepare_audio
+from .scheduler import FragmentScheduler, run_in_process, run_in_thread
 
 logger = logging.getLogger("fireredasr2.gateway")
 MODEL = "fireredasr2-llm"
@@ -35,7 +38,8 @@ class Settings:
     max_upload_mb: int = 256
     max_batch_files: int = 32
     max_audio_seconds: float = 3600
-    max_active_jobs: int = 8
+    queue_capacity: int = 256
+    preprocess_concurrency: int = 4
     backend_concurrency: int = 8
     backend_timeout: float = 120
     max_completion_tokens: int = 512
@@ -44,6 +48,9 @@ class Settings:
     @classmethod
     def from_env(cls):
         env = os.environ
+        if "MAX_ACTIVE_JOBS" in env:
+            raise ValueError("MAX_ACTIVE_JOBS was replaced by QUEUE_CAPACITY and PREPROCESS_CONCURRENCY; "
+                             "remove it and configure the new limits")
         return cls(
             backend_url=env.get("BACKEND_URL", "http://127.0.0.1:8001").rstrip("/"),
             backend_api_key=env.get("BACKEND_API_KEY", ""),
@@ -57,7 +64,8 @@ class Settings:
             max_upload_mb=int(env.get("MAX_UPLOAD_MB", "256")),
             max_batch_files=int(env.get("MAX_BATCH_FILES", "32")),
             max_audio_seconds=float(env.get("MAX_AUDIO_SECONDS", "3600")),
-            max_active_jobs=int(env.get("MAX_ACTIVE_JOBS", "8")),
+            queue_capacity=int(env.get("QUEUE_CAPACITY", "256")),
+            preprocess_concurrency=int(env.get("PREPROCESS_CONCURRENCY", "4")),
             backend_concurrency=int(env.get("BACKEND_CONCURRENCY", "8")),
             backend_timeout=float(env.get("BACKEND_TIMEOUT_SECONDS", "120")),
             max_completion_tokens=int(env.get("MAX_COMPLETION_TOKENS", "512")),
@@ -71,7 +79,7 @@ class Settings:
             raise ValueError("VAD_MODE must be 0..3; VAD_FRAME_MS must be 10, 20 or 30")
         if self.vad_silence_ms <= 0 or self.vad_padding_ms < 0:
             raise ValueError("VAD_SILENCE_MS must be positive; VAD_PADDING_MS nonnegative")
-        for name in ("max_upload_mb", "max_batch_files", "max_audio_seconds", "max_active_jobs",
+        for name in ("max_upload_mb", "max_batch_files", "max_audio_seconds", "queue_capacity", "preprocess_concurrency",
                      "backend_concurrency", "backend_timeout", "max_completion_tokens",
                      "media_timeout"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
@@ -138,15 +146,34 @@ def create_app(settings=None, transport=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        app.state.active_jobs = 0
-        app.state.slots = asyncio.Semaphore(cfg.backend_concurrency)
-        async with httpx.AsyncClient(
-            base_url=cfg.backend_url, timeout=cfg.backend_timeout,
-            headers={"Authorization": f"Bearer {cfg.backend_api_key}"} if cfg.backend_api_key else {},
-            transport=transport, limits=httpx.Limits(max_connections=cfg.backend_concurrency + 2),
-        ) as client:
-            app.state.client = client
-            yield
+        app.state.admitted_files = 0
+        app.state.file_tasks = set()
+        app.state.preprocessing = asyncio.Semaphore(cfg.preprocess_concurrency)
+        # Spawn avoids inheriting the event loop, HTTP connections or thread locks.
+        pool = ProcessPoolExecutor(
+            max_workers=cfg.preprocess_concurrency,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+        app.state.preprocess_pool = pool
+        try:
+            async with httpx.AsyncClient(
+                base_url=cfg.backend_url, timeout=cfg.backend_timeout,
+                headers={"Authorization": f"Bearer {cfg.backend_api_key}"} if cfg.backend_api_key else {},
+                transport=transport, limits=httpx.Limits(max_connections=cfg.backend_concurrency + 2),
+            ) as client:
+                app.state.client = client
+                async with FragmentScheduler(cfg.backend_concurrency, recognize) as scheduler:
+                    app.state.scheduler = scheduler
+                    try:
+                        yield
+                    finally:
+                        # Drain file tasks (including CPU work) before closing the backend.
+                        tasks = list(app.state.file_tasks)
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await run_in_thread(lambda: pool.shutdown(wait=True, cancel_futures=True))
 
     app = FastAPI(title="FireRedASR2-LLM WebRTC Gateway", version="2.0.0", lifespan=lifespan)
     # The upload budget covers all files in a request, plus 1 MiB of metadata.
@@ -174,49 +201,50 @@ def create_app(settings=None, transport=None):
         return {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "local"}]}
 
     async def recognize(pcm, start, end):
-        async with app.state.slots:
-            try:
-                # Cut inside the slot so only in-flight slices are held in memory.
-                payload = await asyncio.to_thread(cut_wav, pcm, start, end)
-                response = await app.state.client.post(
-                    "/v1/audio/transcriptions",
-                    files={"file": ("chunk.wav", payload, "audio/wav")},
-                    data={"model": MODEL, "response_format": "json", "temperature": "0",
-                          "repetition_penalty": "1.0",
-                          "max_completion_tokens": str(cfg.max_completion_tokens)},
-                )
-                response.raise_for_status()
-                result = response.json()
-                if not isinstance(result.get("text"), str):
-                    raise ValueError("Missing text")
-                return result["text"].strip()
-            except httpx.TimeoutException as exc:
-                raise HTTPException(504, "ASR backend timed out; no partial transcript returned") from exc
-            except (httpx.HTTPError, ValueError, AttributeError) as exc:
-                logger.warning("Backend failure: %s", type(exc).__name__)
-                raise HTTPException(502, "ASR backend failed; check backend logs") from exc
+        try:
+            # The scheduler bounds both slicing and backend requests.
+            payload = await run_in_thread(cut_wav, pcm, start, end)
+            response = await app.state.client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("chunk.wav", payload, "audio/wav")},
+                data={"model": MODEL, "response_format": "json", "temperature": "0",
+                      "repetition_penalty": "1.0",
+                      "max_completion_tokens": str(cfg.max_completion_tokens)},
+            )
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result.get("text"), str):
+                raise ValueError("Missing text")
+            return result["text"].strip()
+        except httpx.TimeoutException as exc:
+            raise HTTPException(504, "ASR backend timed out; no partial transcript returned") from exc
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            logger.warning("Backend failure: %s", type(exc).__name__)
+            raise HTTPException(502, "ASR backend failed; check backend logs") from exc
 
     async def transcribe_file(file, audio_format, response_format, request_id):
         started = time.monotonic()
-        upload = bytearray()
-        while data := await file.read(1024 * 1024):
-            upload += data
-            if len(upload) > cfg.max_upload_mb * 1024 * 1024:
-                raise HTTPException(413, "Audio file too large")
-        if not upload:
-            raise HTTPException(400, "Audio file is empty")
-        try:
-            duration, pcm, plan = await asyncio.to_thread(
-                prepare_audio, bytes(upload), cfg, audio_format,
-            )
-        except AudioError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        del upload
-        segments = []
-        for index, (start, end, silent) in enumerate(plan):
-            text = "" if silent else await recognize(pcm, start, end)
-            segments.append({"id": index, "start": round(start, 3), "end": round(end, 3),
-                             "text": text, "skipped_silence": silent})
+        async with app.state.preprocessing:
+            upload = bytearray()
+            while data := await file.read(1024 * 1024):
+                upload += data
+                if len(upload) > cfg.max_upload_mb * 1024 * 1024:
+                    raise HTTPException(413, "Audio file too large")
+            if not upload:
+                raise HTTPException(400, "Audio file is empty")
+            try:
+                duration, pcm, plan = await run_in_process(
+                    app.state.preprocess_pool, prepare_audio, bytes(upload), cfg, audio_format,
+                )
+            except AudioError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            del upload
+        texts = await app.state.scheduler.submit(pcm, plan)
+        segments = [
+            {"id": index, "start": round(start, 3), "end": round(end, 3),
+             "text": texts[index], "skipped_silence": silent}
+            for index, (start, end, silent) in enumerate(plan)
+        ]
         text = join_text(item["text"] for item in segments)
         elapsed = time.monotonic() - started
         logger.info("request=%s duration=%.2f elapsed=%.2f chunks=%d",
@@ -232,6 +260,7 @@ def create_app(settings=None, transport=None):
 
     @app.post("/v1/audio/transcriptions", dependencies=[Depends(auth)])
     async def transcribe(
+        request: Request,
         file: Annotated[list[UploadFile], File(description="One or more files; repeat the file field")],
         uttid: Annotated[list[str] | None, Form(description="Optional unique IDs, one per file in upload order")] = None,
         audio_format: Annotated[
@@ -242,8 +271,9 @@ def create_app(settings=None, transport=None):
         response_format: Annotated[str, Form()] = "json",
         stream: Annotated[bool, Form()] = False,
     ):
-        reserved_jobs = 0
         tasks = []
+        disconnected = None
+        batch = None
         try:
             if model != MODEL:
                 raise HTTPException(400, f"model must be {MODEL}")
@@ -261,52 +291,67 @@ def create_app(settings=None, transport=None):
             if sum(item.size or 0 for item in file) > cfg.max_upload_mb * 1024 * 1024:
                 raise HTTPException(413, "Total audio upload too large")
 
-            # Reserve available file slots without yielding. A large batch runs
-            # in waves within these slots, rather than bypassing the global cap.
-            reserved_jobs = min(len(file), cfg.max_active_jobs - app.state.active_jobs)
-            if reserved_jobs <= 0:
-                reserved_jobs = 0
-                raise HTTPException(429, "Too many active transcription jobs", headers={"Retry-After": "5"})
-            app.state.active_jobs += reserved_jobs
+            # Admission is atomic for the entire batch; count all unfinished files.
+            if app.state.admitted_files + len(file) > cfg.queue_capacity:
+                raise HTTPException(429, "Audio queue is full", headers={"Retry-After": "5"})
+            app.state.admitted_files += len(file)
             request_id = uuid.uuid4().hex
             headers = {"X-Request-ID": request_id}
             utterance_ids = uttid if uttid is not None else [f"{request_id}-{i}" for i in range(len(file))]
 
-            pending = iter(enumerate(file))
-            results = [None] * len(file)
-
-            async def worker():
-                for index, upload in pending:
-                    item = {"uttid": utterance_ids[index], "index": index, "filename": upload.filename}
-                    try:
-                        result = await transcribe_file(
-                            upload, audio_format, response_format, f"{request_id}-{index}",
-                        )
-                        item.update(status_code=200, **result)
-                    except HTTPException as exc:
-                        item.update(status_code=exc.status_code, error=exc.detail)
-                    except Exception:
-                        logger.exception("request=%s file_index=%d failed", request_id, index)
-                        item.update(status_code=500, error="Audio processing failed; check gateway logs")
-                    results[index] = item
+            async def process_file(index, upload):
+                item = {"uttid": utterance_ids[index], "index": index, "filename": upload.filename}
+                try:
+                    result = await transcribe_file(
+                        upload, audio_format, response_format, f"{request_id}-{index}",
+                    )
+                    item.update(status_code=200, **result)
+                except HTTPException as exc:
+                    item.update(status_code=exc.status_code, error=exc.detail)
+                except Exception:
+                    logger.exception("request=%s file_index=%d failed", request_id, index)
+                    item.update(status_code=500, error="Audio processing failed; check gateway logs")
+                finally:
                     await upload.close()
+                return item
 
-            tasks = [asyncio.create_task(worker()) for _ in range(reserved_jobs)]
-            await asyncio.gather(*tasks)
+            def release_file(task):
+                # Done callbacks also run for tasks cancelled before their first step.
+                app.state.admitted_files -= 1
+                app.state.file_tasks.discard(task)
+
+            for index, upload in enumerate(file):
+                task = asyncio.create_task(process_file(index, upload))
+                task.add_done_callback(release_file)
+                app.state.file_tasks.add(task)
+                tasks.append(task)
+            async def wait_for_disconnect():
+                while (await request.receive())["type"] != "http.disconnect":
+                    pass
+
+            disconnected = asyncio.create_task(wait_for_disconnect())
+            batch = asyncio.gather(*tasks)
+            done, _ = await asyncio.wait((batch, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if batch not in done:
+                raise HTTPException(499, "Client disconnected")
+            results = await batch
             return JSONResponse({
                 "request_id": request_id,
                 "results": [item for item in results if item["status_code"] == 200],
                 "errors": [item for item in results if item["status_code"] != 200],
             }, headers=headers)
         finally:
-            # Drain workers before releasing capacity or closing queued uploads,
-            # including when the request is cancelled during backend inference.
+            # Drain all file work before closing uploads on request cancellation.
+            if disconnected is not None:
+                disconnected.cancel()
+                await asyncio.gather(disconnected, return_exceptions=True)
             for task in tasks:
                 if not task.done():
                     task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            app.state.active_jobs -= reserved_jobs
+            if batch is not None:
+                await asyncio.gather(batch, return_exceptions=True)
             for upload in file:
                 await upload.close()
 

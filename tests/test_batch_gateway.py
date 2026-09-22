@@ -71,7 +71,7 @@ def test_single_file_uses_unified_response(audio_format, response_format):
         if response_format == "verbose_json":
             assert item["duration"] == 0.05
             assert item["request_id"] == f'{body["request_id"]}-0'
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
 
 
 @pytest.mark.parametrize("audio_format", ["wav", "pcm"])
@@ -109,7 +109,7 @@ def test_batch_parallelism_and_upload_order(audio_format, response_format):
                 if response_format == "verbose_json":
                     assert all(r["duration"] == 0.05 and len(r["segments"]) == 1 for r in body["results"])
                     assert len({r["request_id"] for r in body["results"]}) == 2
-                assert app.state.active_jobs == 0
+                assert app.state.admitted_files == 0
 
     asyncio.run(run())
 
@@ -129,7 +129,7 @@ def test_batch_partial_failure_does_not_discard_success(failure):
     uploads = files(3)
     if failure == "invalid_audio":
         uploads[1] = ("file", ("bad.wav", b"not a wav"))
-    app = create_app(Settings(vad_enabled=False, max_active_jobs=1), httpx.MockTransport(fail_one))
+    app = create_app(Settings(vad_enabled=False, preprocess_concurrency=1), httpx.MockTransport(fail_one))
     with TestClient(app) as client:
         response = client.post("/v1/audio/transcriptions", files=uploads)
         assert response.status_code == 200
@@ -142,7 +142,7 @@ def test_batch_partial_failure_does_not_discard_success(failure):
                                            "timeout": 504, "internal_error": 500}[failure]
         assert "error" in errors[0] and "text" not in errors[0]
         assert "private internal detail" not in response.text
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
 
 
 def test_all_invalid_batch_has_per_file_errors():
@@ -156,11 +156,11 @@ def test_all_invalid_batch_has_per_file_errors():
         assert response.status_code == 200
         assert response.json()["results"] == []
         assert [r["status_code"] for r in response.json()["errors"]] == [400, 400]
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
 
 
 @pytest.mark.parametrize("backend_concurrency", [1, 2])
-def test_batch_larger_than_job_capacity_runs_in_bounded_waves(backend_concurrency):
+def test_batch_larger_than_worker_count_runs_with_bounded_backend_concurrency(backend_concurrency):
     async def run():
         active = peak = 0
         jobs_seen = []
@@ -169,14 +169,14 @@ def test_batch_larger_than_job_capacity_runs_in_bounded_waves(backend_concurrenc
             nonlocal active, peak
             active += 1
             peak = max(peak, active)
-            jobs_seen.append(app.state.active_jobs)
+            jobs_seen.append(app.state.admitted_files)
             try:
                 await asyncio.sleep(0.01)
                 return backend(request)
             finally:
                 active -= 1
 
-        app = create_app(Settings(vad_enabled=False, max_active_jobs=2,
+        app = create_app(Settings(vad_enabled=False, preprocess_concurrency=2,
                                   backend_concurrency=backend_concurrency), httpx.MockTransport(measured_backend))
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
@@ -184,8 +184,9 @@ def test_batch_larger_than_job_capacity_runs_in_bounded_waves(backend_concurrenc
                 assert response.status_code == 200
                 assert [r["text"] for r in response.json()["results"]] == [f"text {i}" for i in range(1, 8)]
                 assert peak == backend_concurrency
-                assert all(j == 2 for j in jobs_seen)
-                assert app.state.active_jobs == 0
+                assert max(jobs_seen) == 7
+                assert all(1 <= j <= 7 for j in jobs_seen)
+                assert app.state.admitted_files == 0
 
     asyncio.run(run())
 
@@ -206,7 +207,7 @@ def test_capacity_is_shared_with_other_requests_and_released_on_cancel():
             finally:
                 active -= 1
 
-        app = create_app(Settings(vad_enabled=False, max_active_jobs=1), httpx.MockTransport(blocked_backend))
+        app = create_app(Settings(vad_enabled=False, queue_capacity=3), httpx.MockTransport(blocked_backend))
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
                 task = asyncio.create_task(client.post("/v1/audio/transcriptions", files=files(3)))
@@ -216,17 +217,17 @@ def test_capacity_is_shared_with_other_requests_and_released_on_cancel():
                         rejected = await client.post("/v1/audio/transcriptions", files=files(count))
                         assert rejected.status_code == 429
                         assert rejected.headers["retry-after"] == "5"
-                        assert app.state.active_jobs == 1
+                        assert app.state.admitted_files == 3
                 finally:
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await task
                     release.set()
                 assert active == 0
-                assert app.state.active_jobs == 0
+                assert app.state.admitted_files == 0
                 accepted = await client.post("/v1/audio/transcriptions", files=files())
                 assert accepted.status_code == 200
-                assert app.state.active_jobs == 0
+                assert app.state.admitted_files == 0
 
     asyncio.run(run())
 
@@ -247,7 +248,7 @@ def test_request_validation(data, count, status):
     with TestClient(app) as client:
         response = client.post("/v1/audio/transcriptions", data=data, files=files(count))
         assert response.status_code == status
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
 
 
 def test_batch_upload_budget_applies_to_total_files():
@@ -258,7 +259,7 @@ def test_batch_upload_budget_applies_to_total_files():
                                files=[("file", ("a.pcm", b"\x00" * 600000)),
                                       ("file", ("b.pcm", b"\x00" * 600000))])
         assert response.status_code == 413
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
 
 
 def test_batch_authentication_and_backend_key():
@@ -312,7 +313,7 @@ def test_single_failure_uses_unified_errors_array():
         assert len(response.json()["errors"]) == 1
         assert response.json()["errors"][0]["status_code"] == 400
         assert response.json()["errors"][0]["uttid"]
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
 
 
 def test_single_and_batch_share_global_backend_limit():
@@ -334,7 +335,7 @@ def test_single_and_batch_share_global_backend_limit():
             finally:
                 active -= 1
 
-        app = create_app(Settings(vad_enabled=False, max_active_jobs=3, backend_concurrency=1),
+        app = create_app(Settings(vad_enabled=False, queue_capacity=6, backend_concurrency=1),
                          httpx.MockTransport(measured_backend))
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
@@ -344,7 +345,7 @@ def test_single_and_batch_share_global_backend_limit():
                     await asyncio.wait_for(first_entered.wait(), 2)
                     batch = asyncio.create_task(client.post("/v1/audio/transcriptions", files=files(5)))
                     async def admitted():
-                        while app.state.active_jobs != 3:
+                        while app.state.admitted_files != 6:
                             await asyncio.sleep(0)
                     await asyncio.wait_for(admitted(), 2)
                     rejected = await client.post("/v1/audio/transcriptions", files=files())
@@ -355,7 +356,7 @@ def test_single_and_batch_share_global_backend_limit():
                     assert len(responses[1].json()["results"]) == 5
                     assert responses[1].json()["errors"] == []
                     assert peak == 1
-                    assert app.state.active_jobs == 0
+                    assert app.state.admitted_files == 0
                 finally:
                     release.set()
                     for task in (single, batch):
@@ -395,4 +396,285 @@ def test_invalid_uttids_reject_entire_request(ids):
         assert response.status_code == 400
         assert "detail" in response.json()
         assert "results" not in response.json()
-        assert app.state.active_jobs == 0
+        assert app.state.admitted_files == 0
+
+
+def test_queue_rejects_whole_batch_without_partial_admission():
+    app = create_app(Settings(vad_enabled=False, queue_capacity=2), httpx.MockTransport(backend))
+    with TestClient(app) as client:
+        response = client.post('/v1/audio/transcriptions', files=files(3))
+        assert response.status_code == 429
+        assert response.headers['retry-after'] == '5'
+        assert app.state.admitted_files == 0
+        assert client.post('/v1/audio/transcriptions', files=files(2)).json()['errors'] == []
+
+
+def test_file_completion_frees_capacity_before_batch_finishes():
+    async def run():
+        slow_entered = asyncio.Event()
+        release = asyncio.Event()
+        async def slow_backend(request):
+            if backend_number(request) == 1:
+                slow_entered.set()
+                await release.wait()
+            return backend(request)
+        app = create_app(Settings(vad_enabled=False, queue_capacity=2), httpx.MockTransport(slow_backend))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+                batch = asyncio.create_task(client.post('/v1/audio/transcriptions', files=files(2)))
+                try:
+                    await asyncio.wait_for(slow_entered.wait(), 2)
+                    async def free_slot():
+                        while app.state.admitted_files != 1:
+                            await asyncio.sleep(0)
+                    await asyncio.wait_for(free_slot(), 2)
+                    assert not batch.done()
+                    response = await client.post('/v1/audio/transcriptions', files=[('file', ('third.wav', audio(3)))])
+                    assert response.json()['results'][0]['text'] == 'text 3'
+                    assert app.state.admitted_files == 1
+                finally:
+                    release.set()
+                    await batch
+                assert app.state.admitted_files == 0
+    asyncio.run(run())
+
+
+@pytest.fixture
+def controlled_preprocessor(monkeypatch):
+    import importlib
+    import multiprocessing
+    from functools import partial
+    from types import SimpleNamespace
+    from process_helpers import controlled_prepare
+
+    module = importlib.import_module('gateway.app')
+    with multiprocessing.get_context('spawn').Manager() as manager:
+        state = manager.dict(active=0, peak=0, started=0)
+        lock = manager.Lock()
+        release = manager.Event()
+        pids = manager.list()
+        monkeypatch.setattr(module, 'prepare_audio', partial(controlled_prepare, state, lock, release, pids))
+        try:
+            yield SimpleNamespace(state=state, release=release, pids=pids)
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize('workers', [2, 4])
+def test_preprocessing_limit_is_independent_of_backend_and_uses_processes(controlled_preprocessor, workers):
+    import multiprocessing
+    import os
+    control = controlled_preprocessor
+    state = control.state
+    async def run():
+        backend_entered = asyncio.Event()
+        release_backend = asyncio.Event()
+        async def blocked_backend(request):
+            backend_entered.set()
+            await release_backend.wait()
+            return backend(request)
+        # Omit the override for four workers to verify the production default.
+        overrides = {} if workers == 4 else {'preprocess_concurrency': workers}
+        app = create_app(Settings(vad_enabled=False, backend_concurrency=1, **overrides),
+                         httpx.MockTransport(blocked_backend))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+                task = asyncio.create_task(client.post('/v1/audio/transcriptions', files=files(5)))
+                async def wait_until(predicate):
+                    while not predicate():
+                        await asyncio.sleep(0.005)
+                try:
+                    await asyncio.wait_for(wait_until(lambda: state['active'] == workers), 5)
+                    assert state['started'] == workers and app.state.admitted_files == 5
+                    assert len(control.pids) == workers and os.getpid() not in control.pids
+                    control.release.set()
+                    await asyncio.wait_for(backend_entered.wait(), 5)
+                    await asyncio.wait_for(wait_until(lambda: state['started'] == 5 and state['active'] == 0), 5)
+                    assert app.state.admitted_files == 5 and not task.done()
+                    assert state['peak'] == workers
+                finally:
+                    control.release.set()
+                    release_backend.set()
+                    response = await task
+                assert response.json()['errors'] == []
+                worker_pids = set(control.pids)
+                # Subsequent requests reuse the same process pool.
+                response = await client.post('/v1/audio/transcriptions', files=files(5))
+                assert response.json()['errors'] == []
+                assert set(control.pids) == worker_pids
+        assert not worker_pids.intersection(child.pid for child in multiprocessing.active_children())
+    asyncio.run(run())
+
+
+def test_long_audio_fragments_run_concurrently_and_keep_text_order():
+    async def run():
+        second = asyncio.Event()
+        order = []
+        async def reordered(request):
+            number = backend_number(request)
+            if number == 1:
+                await asyncio.wait_for(second.wait(), 2)
+            order.append(number)
+            if number == 2:
+                second.set()
+            return backend(request)
+        app = create_app(Settings(vad_enabled=False, chunk_seconds=0.05, backend_concurrency=2),
+                         httpx.MockTransport(reordered))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+                pcm = audio(1, 'pcm') + audio(2, 'pcm') + audio(3, 'pcm')
+                response = await client.post('/v1/audio/transcriptions', files=[('file', ('long.pcm', pcm))],
+                                            data={'audio_format': 'pcm', 'response_format': 'verbose_json'})
+                result = response.json()['results'][0]
+                assert order[0] == 2
+                assert result['text'] == 'text 1 text 2 text 3'
+                assert [segment['text'] for segment in result['segments']] == ['text 1', 'text 2', 'text 3']
+                assert app.state.admitted_files == 0
+    asyncio.run(run())
+
+
+def test_queue_settings_and_legacy_configuration(monkeypatch):
+    monkeypatch.setenv('QUEUE_CAPACITY', '12')
+    monkeypatch.setenv('PREPROCESS_CONCURRENCY', '3')
+    assert Settings.from_env().queue_capacity == 12
+    assert Settings.from_env().preprocess_concurrency == 3
+    for name in ('queue_capacity', 'preprocess_concurrency'):
+        with pytest.raises(ValueError, match=name):
+            Settings(**{name: 0}).validate()
+    monkeypatch.setenv('MAX_ACTIVE_JOBS', '8')
+    with pytest.raises(ValueError, match='MAX_ACTIVE_JOBS was replaced'):
+        Settings.from_env()
+
+
+def test_client_disconnect_cleans_waiting_and_inflight_audio():
+    async def run():
+        entered = asyncio.Event()
+        active = 0
+        async def blocked_backend(request):
+            nonlocal active
+            active += 1
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+        app = create_app(Settings(vad_enabled=False, backend_concurrency=1, queue_capacity=3),
+                         httpx.MockTransport(blocked_backend))
+        request = httpx.Request('POST', 'http://test/v1/audio/transcriptions', files=files(3))
+        body = request.read()
+        scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1',
+                 'method': 'POST', 'scheme': 'http', 'path': '/v1/audio/transcriptions',
+                 'raw_path': b'/v1/audio/transcriptions', 'query_string': b'',
+                 'headers': [(key.lower(), value) for key, value in request.headers.raw], 'server': ('test', 80), 'client': ('test', 123)}
+        messages = asyncio.Queue()
+        messages.put_nowait({'type': 'http.request', 'body': body, 'more_body': False})
+        sent = []
+        async def send(message):
+            sent.append(message)
+        async with app.router.lifespan_context(app):
+            task = asyncio.create_task(app(scope, messages.get, send))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                assert app.state.admitted_files == 3
+                messages.put_nowait({'type': 'http.disconnect'})
+                await asyncio.wait_for(task, 2)
+                assert active == 0
+                assert app.state.admitted_files == 0
+                assert not app.state.file_tasks
+                assert not app.state.scheduler.running and not app.state.scheduler.ready
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(run())
+
+
+def test_shutdown_cancels_queued_and_running_files():
+    async def run():
+        entered = asyncio.Event()
+        active = 0
+        async def blocked_backend(request):
+            nonlocal active
+            active += 1
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+        app = create_app(Settings(vad_enabled=False, backend_concurrency=1),
+                         httpx.MockTransport(blocked_backend))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+            async with app.router.lifespan_context(app):
+                task = asyncio.create_task(client.post('/v1/audio/transcriptions', files=files(5)))
+                await asyncio.wait_for(entered.wait(), 2)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert app.state.admitted_files == 0 and active == 0
+            assert not app.state.file_tasks
+            assert app.state.client.is_closed
+    asyncio.run(run())
+
+
+def test_cancel_during_preprocessing_holds_capacity_until_process_finishes(controlled_preprocessor):
+    control = controlled_preprocessor
+    async def run():
+        app = create_app(Settings(vad_enabled=False, queue_capacity=2, preprocess_concurrency=1),
+                         httpx.MockTransport(backend))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+                task = asyncio.create_task(client.post('/v1/audio/transcriptions', files=files(2)))
+                try:
+                    async def wait_for_process():
+                        while control.state['active'] != 1:
+                            await asyncio.sleep(0.005)
+                    await asyncio.wait_for(wait_for_process(), 5)
+                    task.cancel()
+                    # Let cancellation reach both the pending file and CPU worker.
+                    for _ in range(20):
+                        await asyncio.sleep(0)
+                    assert not task.done()
+                    assert app.state.admitted_files == 1
+                    assert app.state.preprocessing.locked()
+                    assert control.state['started'] == 1
+                finally:
+                    control.release.set()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                assert app.state.admitted_files == 0
+                assert control.state['active'] == 0
+                assert not app.state.preprocessing.locked()
+                response = await client.post('/v1/audio/transcriptions', files=files())
+                assert response.json()['errors'] == []
+    asyncio.run(run())
+
+
+def test_fragment_failure_discards_file_text_but_preserves_other_audio():
+    async def run():
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+        async def failing_backend(request):
+            number = backend_number(request)
+            if number == 1:
+                await asyncio.wait_for(entered.wait(), 2)
+                return httpx.Response(503)
+            if number == 2:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return backend(request)
+        app = create_app(Settings(vad_enabled=False, chunk_seconds=0.05, backend_concurrency=2),
+                         httpx.MockTransport(failing_backend))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+                long_pcm = audio(1, 'pcm') + audio(2, 'pcm') + audio(3, 'pcm')
+                response = await asyncio.wait_for(client.post(
+                    '/v1/audio/transcriptions', data={'audio_format': 'pcm'},
+                    files=[('file', ('long.pcm', long_pcm)), ('file', ('ok.pcm', audio(4, 'pcm')))]), 2)
+                body = response.json()
+                assert body['results'][0]['text'] == 'text 4'
+                assert body['errors'][0]['index'] == 0 and body['errors'][0]['status_code'] == 502
+                assert 'text' not in body['errors'][0]
+                assert cancelled.is_set() and app.state.admitted_files == 0
+    asyncio.run(run())
