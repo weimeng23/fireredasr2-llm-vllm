@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
 from .audio import AudioError, cut_wav, join_text, prepare_audio
 
@@ -33,6 +33,7 @@ class Settings:
     vad_silence_ms: int = 500
     vad_padding_ms: int = 200
     max_upload_mb: int = 256
+    max_batch_files: int = 32
     max_audio_seconds: float = 3600
     max_active_jobs: int = 8
     backend_concurrency: int = 8
@@ -54,6 +55,7 @@ class Settings:
             vad_silence_ms=int(env.get("VAD_SILENCE_MS", "500")),
             vad_padding_ms=int(env.get("VAD_PADDING_MS", "200")),
             max_upload_mb=int(env.get("MAX_UPLOAD_MB", "256")),
+            max_batch_files=int(env.get("MAX_BATCH_FILES", "32")),
             max_audio_seconds=float(env.get("MAX_AUDIO_SECONDS", "3600")),
             max_active_jobs=int(env.get("MAX_ACTIVE_JOBS", "8")),
             backend_concurrency=int(env.get("BACKEND_CONCURRENCY", "8")),
@@ -69,7 +71,7 @@ class Settings:
             raise ValueError("VAD_MODE must be 0..3; VAD_FRAME_MS must be 10, 20 or 30")
         if self.vad_silence_ms <= 0 or self.vad_padding_ms < 0:
             raise ValueError("VAD_SILENCE_MS must be positive; VAD_PADDING_MS nonnegative")
-        for name in ("max_upload_mb", "max_audio_seconds", "max_active_jobs",
+        for name in ("max_upload_mb", "max_batch_files", "max_audio_seconds", "max_active_jobs",
                      "backend_concurrency", "backend_timeout", "max_completion_tokens",
                      "media_timeout"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
@@ -147,7 +149,7 @@ def create_app(settings=None, transport=None):
             yield
 
     app = FastAPI(title="FireRedASR2-LLM WebRTC Gateway", version="2.0.0", lifespan=lifespan)
-    # Allow 1 MiB for multipart metadata in addition to the file budget.
+    # The upload budget covers all files in a request, plus 1 MiB of metadata.
     app.add_middleware(UploadLimit, max_bytes=cfg.max_upload_mb * 1024 * 1024 + 1024 * 1024,
                        api_key=cfg.api_key)
 
@@ -194,65 +196,119 @@ def create_app(settings=None, transport=None):
                 logger.warning("Backend failure: %s", type(exc).__name__)
                 raise HTTPException(502, "ASR backend failed; check backend logs") from exc
 
+    async def transcribe_file(file, audio_format, response_format, request_id):
+        started = time.monotonic()
+        upload = bytearray()
+        while data := await file.read(1024 * 1024):
+            upload += data
+            if len(upload) > cfg.max_upload_mb * 1024 * 1024:
+                raise HTTPException(413, "Audio file too large")
+        if not upload:
+            raise HTTPException(400, "Audio file is empty")
+        try:
+            duration, pcm, plan = await asyncio.to_thread(
+                prepare_audio, bytes(upload), cfg, audio_format,
+            )
+        except AudioError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        del upload
+        segments = []
+        for index, (start, end, silent) in enumerate(plan):
+            text = "" if silent else await recognize(pcm, start, end)
+            segments.append({"id": index, "start": round(start, 3), "end": round(end, 3),
+                             "text": text, "skipped_silence": silent})
+        text = join_text(item["text"] for item in segments)
+        elapsed = time.monotonic() - started
+        logger.info("request=%s duration=%.2f elapsed=%.2f chunks=%d",
+                    request_id, duration, elapsed, len(plan))
+        result = {"text": text}
+        if response_format == "verbose_json":
+            result.update(duration=round(duration, 3), segments=segments,
+                          request_id=request_id, elapsed_seconds=round(elapsed, 3),
+                          rtf=round(elapsed / duration, 4),
+                          timestamp_type="vad_chunk_boundaries" if cfg.vad_enabled else "chunk_boundaries",
+                          vad="webrtc" if cfg.vad_enabled else "disabled")
+        return result
+
     @app.post("/v1/audio/transcriptions", dependencies=[Depends(auth)])
     async def transcribe(
-        file: Annotated[UploadFile, File()],
+        file: Annotated[list[UploadFile], File(description="One or more files; repeat the file field")],
+        uttid: Annotated[list[str] | None, Form(description="Optional unique IDs, one per file in upload order")] = None,
         audio_format: Annotated[
             Literal["pcm", "wav"],
-            Form(description="Input format: 16000 Hz mono signed PCM16LE, raw or WAV"),
+            Form(description="Format shared by all files: 16000 Hz mono PCM16LE, raw or WAV"),
         ] = "wav",
         model: Annotated[str, Form()] = MODEL,
         response_format: Annotated[str, Form()] = "json",
         stream: Annotated[bool, Form()] = False,
     ):
-        if model != MODEL:
-            raise HTTPException(400, f"model must be {MODEL}")
-        if response_format not in ("json", "verbose_json", "text"):
-            raise HTTPException(400, "response_format must be json, verbose_json or text")
-        if stream:
-            raise HTTPException(400, "This gateway accepts complete files; stream is not implemented")
-        if app.state.active_jobs >= cfg.max_active_jobs:
-            raise HTTPException(429, "Too many active transcription jobs", headers={"Retry-After": "5"})
-        app.state.active_jobs += 1
-        request_id = uuid.uuid4().hex
-        started = time.monotonic()
+        reserved_jobs = 0
+        tasks = []
         try:
-            upload = bytearray()
-            while data := await file.read(1024 * 1024):
-                upload += data
-                if len(upload) > cfg.max_upload_mb * 1024 * 1024:
-                    raise HTTPException(413, "Audio file too large")
-            if not upload:
-                raise HTTPException(400, "Audio file is empty")
-            try:
-                duration, pcm, plan = await asyncio.to_thread(
-                    prepare_audio, bytes(upload), cfg, audio_format,
-                )
-            except AudioError as exc:
-                raise HTTPException(400, str(exc)) from exc
-            del upload  # the decoded PCM is all the remaining stages need
-            segments = []
-            for index, (start, end, silent) in enumerate(plan):
-                text = "" if silent else await recognize(pcm, start, end)
-                segments.append({"id": index, "start": round(start, 3), "end": round(end, 3),
-                                 "text": text, "skipped_silence": silent})
-            text = join_text(item["text"] for item in segments)
-            elapsed = time.monotonic() - started
-            logger.info("request=%s duration=%.2f elapsed=%.2f chunks=%d",
-                        request_id, duration, elapsed, len(plan))
-            if response_format == "text":
-                return PlainTextResponse(text, headers={"X-Request-ID": request_id})
-            result = {"text": text}
-            if response_format == "verbose_json":
-                result.update(duration=round(duration, 3), segments=segments,
-                              request_id=request_id, elapsed_seconds=round(elapsed, 3),
-                              rtf=round(elapsed / duration, 4),
-                              timestamp_type="vad_chunk_boundaries" if cfg.vad_enabled else "chunk_boundaries",
-                              vad="webrtc" if cfg.vad_enabled else "disabled")
-            return JSONResponse(result, headers={"X-Request-ID": request_id})
+            if model != MODEL:
+                raise HTTPException(400, f"model must be {MODEL}")
+            if response_format not in ("json", "verbose_json"):
+                raise HTTPException(400, "response_format must be json or verbose_json")
+            if stream:
+                raise HTTPException(400, "This gateway accepts complete files; stream is not implemented")
+            if len(file) > cfg.max_batch_files:
+                raise HTTPException(400, f"A request may contain at most {cfg.max_batch_files} files")
+            if uttid is not None:
+                if len(uttid) != len(file) or any(not value.strip() for value in uttid):
+                    raise HTTPException(400, "Provide one non-empty uttid per file")
+                if len(set(uttid)) != len(uttid):
+                    raise HTTPException(400, "uttid values must be unique within a request")
+            if sum(item.size or 0 for item in file) > cfg.max_upload_mb * 1024 * 1024:
+                raise HTTPException(413, "Total audio upload too large")
+
+            # Reserve available file slots without yielding. A large batch runs
+            # in waves within these slots, rather than bypassing the global cap.
+            reserved_jobs = min(len(file), cfg.max_active_jobs - app.state.active_jobs)
+            if reserved_jobs <= 0:
+                reserved_jobs = 0
+                raise HTTPException(429, "Too many active transcription jobs", headers={"Retry-After": "5"})
+            app.state.active_jobs += reserved_jobs
+            request_id = uuid.uuid4().hex
+            headers = {"X-Request-ID": request_id}
+            utterance_ids = uttid if uttid is not None else [f"{request_id}-{i}" for i in range(len(file))]
+
+            pending = iter(enumerate(file))
+            results = [None] * len(file)
+
+            async def worker():
+                for index, upload in pending:
+                    item = {"uttid": utterance_ids[index], "index": index, "filename": upload.filename}
+                    try:
+                        result = await transcribe_file(
+                            upload, audio_format, response_format, f"{request_id}-{index}",
+                        )
+                        item.update(status_code=200, **result)
+                    except HTTPException as exc:
+                        item.update(status_code=exc.status_code, error=exc.detail)
+                    except Exception:
+                        logger.exception("request=%s file_index=%d failed", request_id, index)
+                        item.update(status_code=500, error="Audio processing failed; check gateway logs")
+                    results[index] = item
+                    await upload.close()
+
+            tasks = [asyncio.create_task(worker()) for _ in range(reserved_jobs)]
+            await asyncio.gather(*tasks)
+            return JSONResponse({
+                "request_id": request_id,
+                "results": [item for item in results if item["status_code"] == 200],
+                "errors": [item for item in results if item["status_code"] != 200],
+            }, headers=headers)
         finally:
-            app.state.active_jobs -= 1
-            await file.close()
+            # Drain workers before releasing capacity or closing queued uploads,
+            # including when the request is cancelled during backend inference.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            app.state.active_jobs -= reserved_jobs
+            for upload in file:
+                await upload.close()
 
     return app
 

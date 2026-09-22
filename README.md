@@ -48,26 +48,55 @@ docker run -d \
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `file` | 必填 | 上传音频文件 |
-| `audio_format` | `wav` | `wav`：PCM16 WAV；`pcm`：无文件头的 PCM16LE |
+| `file` | 必填 | 单个文件；上传多条音频时重复此字段 |
+| `uttid` | 自动生成 | 可重复提交，与文件一一对应；传入时必须非空且批内唯一 |
+| `audio_format` | `wav` | 整批共用：`wav` 为 PCM16 WAV，`pcm` 为无文件头的 PCM16LE |
 | `model` | `fireredasr2-llm` | 模型名称 |
-| `response_format` | `json` | `json`、`text` 或 `verbose_json` |
+| `response_format` | `json` | `json` 或 `verbose_json`，均返回统一的 JSON 结构 |
 
-裸 PCM 的采样率、声道和编码由调用方保证。WAV 根据文件头校验参数，不合规音频返回 400，不支持的 `audio_format` 返回 422。接口接收完整文件，不支持 `stream=true`。
+裸 PCM 的采样率、声道和编码由调用方保证。WAV 根据文件头校验参数，不合规音频的错误码为 400，不支持的 `audio_format` 返回 HTTP 422。接口接收完整文件，不支持 `stream=true`。
 
 ```bash
 curl --fail-with-body --max-time 7200 \
   http://127.0.0.1:8000/v1/audio/transcriptions \
   -H 'Authorization: Bearer your-key' \
   -F 'file=@meeting.wav' \
+  -F 'uttid=meeting_001' \
   -F 'response_format=verbose_json'
 ```
 
 上传裸 PCM 时，将文件改为 `meeting.pcm`，并添加 `-F 'audio_format=pcm'`。
 
-网关默认跳过静音，将语音切为最长 25 秒的片段，逐段识别后按顺序拼接；多个文件可并发处理。设置 `VAD_ENABLED=0` 可保留全部音频，仍按最长片段时长切分。纯静音返回空文本，任一片段识别失败则返回错误。
+批量请求使用相同接口，重复提交 `file`：
 
-`json` 返回 `{"text":"转写内容"}`；`text` 返回纯文本；`verbose_json` 额外返回音频时长、片段、请求 ID、处理耗时和 RTF。片段时间戳表示切片边界，不是字级对齐。
+```bash
+curl --fail-with-body --max-time 7200 \
+  http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H 'Authorization: Bearer your-key' \
+  -F 'file=@a.wav' \
+  -F 'uttid=audio_001' \
+  -F 'file=@b.wav' \
+  -F 'uttid=audio_002' \
+  -F 'response_format=json'
+```
+
+单条和 batch 返回相同结构：成功项放在 `results`，失败项放在 `errors`，两个数组始终存在，各自按上传顺序排列。通过 `uttid` 匹配音频；省略时服务端生成 ID，同时返回从 0 开始的原始上传 `index` 和 `filename`。以下为部分失败示例：
+
+```json
+{
+  "request_id": "...",
+  "results": [{"uttid": "audio_001", "index": 0, "filename": "a.wav", "status_code": 200, "text": "转写内容"}],
+  "errors": [{"uttid": "audio_002", "index": 1, "filename": "b.wav", "status_code": 400, "error": "Audio file is empty"}]
+}
+```
+
+单条和 batch 处理完成后均返回 HTTP 200，**必须检查 `errors`，200 不代表全部文件成功**。全部成功时 `errors` 为空，全部失败时 `results` 为空。文件失败不影响同批其他文件；请求级错误（鉴权、参数、文件数、总大小或容量不足）返回非 200 状态和 `{"detail": "..."}`。
+
+默认每批最多 32 个文件，所有文件合计不超过 256 MiB。批次按当前空闲文件处理名额并发执行，超出名额的文件在该批内等待，名额在批次结束后释放；没有空闲名额时，新请求返回 429。`MAX_ACTIVE_JOBS` 限制文件处理名额，`BACKEND_CONCURRENCY` 限制同时发给 vLLM 的片段数。HTTP batch 与 GPU 推理 batch 独立，GPU 调度由 vLLM 负责。
+
+网关默认跳过静音，将语音切为最长 25 秒的片段，逐段识别后按顺序拼接；多个文件可并发处理。设置 `VAD_ENABLED=0` 可保留全部音频，仍按最长片段时长切分。纯静音返回空文本，任一片段识别失败则该文件返回错误。
+
+`json` 的成功项包含转写文本及音频标识；`verbose_json` 在每个成功项中额外返回音频时长、片段、请求 ID、处理耗时和 RTF。片段时间戳表示切片边界，不是字级对齐。网关不提供纯文本响应。
 
 网关固定使用 `temperature=0`、`repetition_penalty=1.0`，输出长度通过 `MAX_COMPLETION_TOKENS` 设置。
 
@@ -102,10 +131,11 @@ curl --fail-with-body --max-time 180 \
 | `VAD_ENABLED` | `1` | 网关是否启用 VAD |
 | `VAD_MODE` | `1` | 检测模式 0–3，数值越大越倾向判为非语音 |
 | `CHUNK_SECONDS` | `25` | 网关切片最长秒数，范围为大于 0 且不超过 30 |
-| `MAX_ACTIVE_JOBS` | `8` | 网关活动文件任务数，超限返回 429 |
+| `MAX_ACTIVE_JOBS` | `8` | 网关文件处理名额，无空闲名额时新请求返回 429 |
 | `BACKEND_CONCURRENCY` | `8` | 网关同时提交的片段识别数 |
 | `MAX_COMPLETION_TOKENS` | `512` | 网关每段识别的输出 token 上限 |
-| `MAX_UPLOAD_MB` | `256` | 网关单文件大小上限，单位 MiB |
+| `MAX_UPLOAD_MB` | `256` | 网关单次请求所有文件合计大小上限，单位 MiB |
+| `MAX_BATCH_FILES` | `32` | 网关单次请求的文件数量上限 |
 | `MAX_AUDIO_SECONDS` | `3600` | 网关单文件时长上限，单位秒 |
 
 ## 客户端示例
@@ -117,11 +147,12 @@ export ASR_API_KEY=your-key
 python3 examples/client.py sample.wav
 python3 examples/client.py meeting.wav --format verbose_json
 python3 examples/client.py meeting.pcm --audio-format pcm --format verbose_json
+python3 examples/client.py a.wav b.wav --uttid audio_001 --uttid audio_002 --format verbose_json
 ```
 
-默认连接 `http://127.0.0.1:8000`，可通过 `--url` 指定服务地址。`verbose_json` 和裸 PCM 示例用于网关模式。
+默认连接 `http://127.0.0.1:8000`，可通过 `--url` 指定服务地址。`verbose_json`、裸 PCM、多文件和 `uttid` 用于网关模式。单条或 batch 返回中有错误时，客户端打印完整响应并以非零状态退出。
 
-也可以使用 [OpenAI SDK 示例](examples/openai_client.py)，安装 `openai` 后运行。通过 `ASR_BASE_URL` 指定服务地址，裸 PCM 使用 `--audio-format pcm`。
+单文件也可以使用 [OpenAI SDK 示例](examples/openai_client.py)，安装 `openai` 后运行。通过 `ASR_BASE_URL` 指定服务地址，裸 PCM 使用 `--audio-format pcm`，音频 ID 使用 `--uttid`。该示例读取原始 JSON 响应以支持网关的统一结构；直连 vLLM 仍返回原生格式。批量上传使用上述标准库客户端或 curl。
 
 ## 服务管理
 
