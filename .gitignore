@@ -1,0 +1,13 @@
+.env
+.venv/
+models/*
+!models/README.md
+__pycache__/
+.pytest_cache/
+*.wav
+*.mp3
+*.log
+*.resolved.txt
+pytest-of-root/
+.test-venv/
+.DS_Store

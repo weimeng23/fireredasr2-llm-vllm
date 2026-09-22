@@ -1,0 +1,16 @@
+.git
+.env
+.venv
+.test-venv
+models
+tests
+examples
+__pycache__
+.pytest_cache
+*.zip
+*.wav
+*.mp3
+*.log
+pytest-of-root
+**/__pycache__
+*.pyc
