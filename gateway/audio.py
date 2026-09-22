@@ -47,7 +47,7 @@ def decode(data: bytes, max_seconds: float, audio_format: str) -> bytes:
     return pcm
 
 
-def detect_speech(pcm: bytes, mode=1, frame_ms=20, silence_ms=500, padding_ms=200,
+def detect_speech(pcm: bytes, mode=1, frame_ms=20, silence_ms=1500, padding_ms=200,
                   timeout=180):
     """Return padded speech intervals in seconds over in-memory PCM16.
 
@@ -97,7 +97,7 @@ def detect_speech(pcm: bytes, mode=1, frame_ms=20, silence_ms=500, padding_ms=20
     return [(start / RATE, end / RATE) for start, end in merged]
 
 
-def plan_chunks(duration, speech, max_seconds=25.0):
+def plan_chunks(duration, speech, max_seconds=30.0):
     """Cover the original timeline once; only speech regions go to ASR."""
     if not 0 < max_seconds <= 30:
         raise ValueError("Require 0 < max_seconds <= 30")

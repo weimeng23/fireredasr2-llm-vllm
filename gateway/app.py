@@ -26,11 +26,11 @@ class Settings:
     backend_url: str = "http://127.0.0.1:8001"
     backend_api_key: str = ""
     api_key: str = ""
-    chunk_seconds: float = 25
+    chunk_seconds: float = 30
     vad_enabled: bool = True
     vad_mode: int = 1
     vad_frame_ms: int = 20
-    vad_silence_ms: int = 500
+    vad_silence_ms: int = 1500
     vad_padding_ms: int = 200
     max_upload_mb: int = 256
     max_batch_files: int = 32
@@ -48,11 +48,11 @@ class Settings:
             backend_url=env.get("BACKEND_URL", "http://127.0.0.1:8001").rstrip("/"),
             backend_api_key=env.get("BACKEND_API_KEY", ""),
             api_key=env.get("ASR_API_KEY", ""),
-            chunk_seconds=float(env.get("CHUNK_SECONDS", "25")),
+            chunk_seconds=float(env.get("CHUNK_SECONDS", "30")),
             vad_enabled=env.get("VAD_ENABLED", "1").lower() in ("1", "true", "yes"),
             vad_mode=int(env.get("VAD_MODE", "1")),
             vad_frame_ms=int(env.get("VAD_FRAME_MS", "20")),
-            vad_silence_ms=int(env.get("VAD_SILENCE_MS", "500")),
+            vad_silence_ms=int(env.get("VAD_SILENCE_MS", "1500")),
             vad_padding_ms=int(env.get("VAD_PADDING_MS", "200")),
             max_upload_mb=int(env.get("MAX_UPLOAD_MB", "256")),
             max_batch_files=int(env.get("MAX_BATCH_FILES", "32")),
