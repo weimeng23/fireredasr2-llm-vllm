@@ -119,6 +119,10 @@ curl --fail-with-body --max-time 7200 \
 
 `QUEUE_CAPACITY` 在上传解析后按音频条数限制接纳容量，不是全局内存字节限制；部署时需结合音频长度、上传大小和可用内存配置。
 
+每个 worker 默认每 10 秒输出一行 `gateway_status` 日志，带节点名和 PID；通过 `GATEWAY_STATUS_INTERVAL_SECONDS` 调整间隔，设为 `0` 关闭。`admitted` 是已接纳音频数/容量，`preprocess_wait` 是等待预处理的音频数，`upload_read` 是正在读取已上传文件的音频数，`preprocess_run` 包含进程池传输及处理，读取和预处理共用 `preprocess_limit` 个名额。
+
+`inference_files` 是进入片段调度后尚未完成的音频数；`ready_files` 和 `pending_segments` 是仍有待调度片段的音频数和片段数。`active_segments` 是已调度片段数/并发上限，`slicing` 是正在切片的数量，`http_inflight` 是尚未结束的后端 HTTP 调用数，不代表 vLLM 正在执行的数量。`cleanup` 是清理中的音频数，`queue_rejections_total` 是该 worker 启动以来因容量不足拒绝的 HTTP 请求数，`loop_lag_ms` 是本次日志定时任务的调度延迟；事件循环阻塞时日志也会延迟输出。日志不包含尚未接纳的上传请求。
+
 网关默认跳过静音，将语音切为最长 30 秒的片段，片段并发识别后按原顺序拼接；多个文件可并发处理。设置 `VAD_ENABLED=0` 可保留全部音频，仍按最长片段时长切分。纯静音返回空文本，任一片段识别失败则该文件返回错误。
 
 `json` 的成功项包含转写文本及音频标识；`verbose_json` 在每个成功项中额外返回音频时长、片段、请求 ID、处理耗时和 RTF。片段时间戳表示切片边界，不是字级对齐。网关不提供纯文本响应。
@@ -154,6 +158,7 @@ curl --fail-with-body --max-time 180 \
 | `MAX_NUM_BATCHED_TOKENS` | `4096` | vLLM 每轮处理的 token 预算 |
 | `MAX_NUM_QUEUED_REQS` | `64` | vLLM 等待和运行的请求总数上限 |
 | `GATEWAY_WORKERS` | `1` | 网关 worker 进程数，正整数，仅 all 模式生效 |
+| `GATEWAY_STATUS_INTERVAL_SECONDS` | `10` | 每个 worker 的状态日志间隔（秒），0 关闭 |
 | `VAD_ENABLED` | `1` | 网关是否启用 VAD |
 | `VAD_MODE` | `1` | 检测模式 0–3，数值越大越倾向判为非语音 |
 | `CHUNK_SECONDS` | `30` | 网关切片最长秒数，范围为大于 0 且不超过 30 |

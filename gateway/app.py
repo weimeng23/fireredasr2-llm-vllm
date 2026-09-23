@@ -6,8 +6,10 @@ import logging
 import math
 import multiprocessing
 import os
+import socket
 import time
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -21,6 +23,8 @@ from .audio import AudioError, cut_wav, join_text, prepare_audio
 from .scheduler import FragmentScheduler, run_in_process, run_in_thread
 
 logger = logging.getLogger("fireredasr2.gateway")
+# Inherit Uvicorn's configured handler and level so periodic INFO logs are visible.
+status_logger = logging.getLogger("uvicorn.error.gateway_status")
 MODEL = "fireredasr2-llm"
 
 
@@ -44,6 +48,7 @@ class Settings:
     backend_timeout: float = 120
     max_completion_tokens: int = 512
     media_timeout: float = 180
+    status_log_interval: float = 10
 
     @classmethod
     def from_env(cls):
@@ -70,9 +75,12 @@ class Settings:
             backend_timeout=float(env.get("BACKEND_TIMEOUT_SECONDS", "120")),
             max_completion_tokens=int(env.get("MAX_COMPLETION_TOKENS", "512")),
             media_timeout=float(env.get("MEDIA_TIMEOUT_SECONDS", "180")),
+            status_log_interval=float(env.get("GATEWAY_STATUS_INTERVAL_SECONDS", "10")),
         )
 
     def validate(self):
+        if not math.isfinite(self.status_log_interval) or self.status_log_interval < 0:
+            raise ValueError("GATEWAY_STATUS_INTERVAL_SECONDS must be finite and nonnegative")
         if not 0 < self.chunk_seconds <= 30:
             raise ValueError("Chunk durations must satisfy 0 < max <= 30")
         if self.vad_mode not in range(4) or self.vad_frame_ms not in (10, 20, 30):
@@ -148,6 +156,10 @@ def create_app(settings=None, transport=None):
     async def lifespan(app):
         app.state.admitted_files = 0
         app.state.file_tasks = set()
+        app.state.file_stages = {}
+        app.state.slicing = 0
+        app.state.http_inflight = 0
+        app.state.queue_rejections = 0
         app.state.preprocessing = asyncio.Semaphore(cfg.preprocess_concurrency)
         # Spawn avoids inheriting the event loop, HTTP connections or thread locks.
         pool = ProcessPoolExecutor(
@@ -164,9 +176,14 @@ def create_app(settings=None, transport=None):
                 app.state.client = client
                 async with FragmentScheduler(cfg.backend_concurrency, recognize) as scheduler:
                     app.state.scheduler = scheduler
+                    reporter = (asyncio.create_task(report_status())
+                                if cfg.status_log_interval > 0 else None)
                     try:
                         yield
                     finally:
+                        if reporter is not None:
+                            reporter.cancel()
+                            await asyncio.gather(reporter, return_exceptions=True)
                         # Drain file tasks (including CPU work) before closing the backend.
                         tasks = list(app.state.file_tasks)
                         for task in tasks:
@@ -179,6 +196,29 @@ def create_app(settings=None, transport=None):
     # The upload budget covers all files in a request, plus 1 MiB of metadata.
     app.add_middleware(UploadLimit, max_bytes=cfg.max_upload_mb * 1024 * 1024 + 1024 * 1024,
                        api_key=cfg.api_key)
+
+    async def report_status():
+        host, pid = socket.gethostname(), os.getpid()
+        while True:
+            due = time.monotonic() + cfg.status_log_interval
+            await asyncio.sleep(cfg.status_log_interval)
+            lag_ms = max(0, time.monotonic() - due) * 1000
+            stages = Counter(app.state.file_stages.values())
+            scheduler = app.state.scheduler
+            status_logger.info(
+                "gateway_status host=%s pid=%d admitted=%d/%d "
+                "preprocess_wait=%d upload_read=%d preprocess_run=%d preprocess_limit=%d "
+                "inference_files=%d ready_files=%d pending_segments=%d "
+                "active_segments=%d/%d slicing=%d http_inflight=%d cleanup=%d "
+                "queue_rejections_total=%d loop_lag_ms=%.1f",
+                host, pid, app.state.admitted_files, cfg.queue_capacity,
+                stages["preprocess_wait"], stages["upload_read"], stages["preprocess_run"],
+                cfg.preprocess_concurrency, stages["inference"], len(scheduler.ready),
+                sum(len(work.pending) for work in scheduler.ready),
+                len(scheduler.running), cfg.backend_concurrency,
+                app.state.slicing, app.state.http_inflight, stages["cleanup"],
+                app.state.queue_rejections, lag_ms,
+            )
 
     async def auth(authorization: Annotated[str | None, Header()] = None):
         if cfg.api_key:
@@ -203,14 +243,22 @@ def create_app(settings=None, transport=None):
     async def recognize(pcm, start, end):
         try:
             # The scheduler bounds both slicing and backend requests.
-            payload = await run_in_thread(cut_wav, pcm, start, end)
-            response = await app.state.client.post(
-                "/v1/audio/transcriptions",
-                files={"file": ("chunk.wav", payload, "audio/wav")},
-                data={"model": MODEL, "response_format": "json", "temperature": "0",
-                      "repetition_penalty": "1.0",
-                      "max_completion_tokens": str(cfg.max_completion_tokens)},
-            )
+            app.state.slicing += 1
+            try:
+                payload = await run_in_thread(cut_wav, pcm, start, end)
+            finally:
+                app.state.slicing -= 1
+            app.state.http_inflight += 1
+            try:
+                response = await app.state.client.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("chunk.wav", payload, "audio/wav")},
+                    data={"model": MODEL, "response_format": "json", "temperature": "0",
+                          "repetition_penalty": "1.0",
+                          "max_completion_tokens": str(cfg.max_completion_tokens)},
+                )
+            finally:
+                app.state.http_inflight -= 1
             response.raise_for_status()
             result = response.json()
             if not isinstance(result.get("text"), str):
@@ -224,7 +272,9 @@ def create_app(settings=None, transport=None):
 
     async def transcribe_file(file, audio_format, response_format, request_id):
         started = time.monotonic()
+        task = asyncio.current_task()
         async with app.state.preprocessing:
+            app.state.file_stages[task] = "upload_read"
             upload = bytearray()
             while data := await file.read(1024 * 1024):
                 upload += data
@@ -233,12 +283,14 @@ def create_app(settings=None, transport=None):
             if not upload:
                 raise HTTPException(400, "Audio file is empty")
             try:
+                app.state.file_stages[task] = "preprocess_run"
                 duration, pcm, plan = await run_in_process(
                     app.state.preprocess_pool, prepare_audio, bytes(upload), cfg, audio_format,
                 )
             except AudioError as exc:
                 raise HTTPException(400, str(exc)) from exc
             del upload
+        app.state.file_stages[task] = "inference"
         texts = await app.state.scheduler.submit(pcm, plan)
         segments = [
             {"id": index, "start": round(start, 3), "end": round(end, 3),
@@ -293,6 +345,7 @@ def create_app(settings=None, transport=None):
 
             # Admission is atomic for the entire batch; count all unfinished files.
             if app.state.admitted_files + len(file) > cfg.queue_capacity:
+                app.state.queue_rejections += 1
                 raise HTTPException(429, "Audio queue is full", headers={"Retry-After": "5"})
             app.state.admitted_files += len(file)
             request_id = uuid.uuid4().hex
@@ -312,6 +365,7 @@ def create_app(settings=None, transport=None):
                     logger.exception("request=%s file_index=%d failed", request_id, index)
                     item.update(status_code=500, error="Audio processing failed; check gateway logs")
                 finally:
+                    app.state.file_stages[asyncio.current_task()] = "cleanup"
                     await upload.close()
                 return item
 
@@ -319,9 +373,11 @@ def create_app(settings=None, transport=None):
                 # Done callbacks also run for tasks cancelled before their first step.
                 app.state.admitted_files -= 1
                 app.state.file_tasks.discard(task)
+                app.state.file_stages.pop(task, None)
 
             for index, upload in enumerate(file):
                 task = asyncio.create_task(process_file(index, upload))
+                app.state.file_stages[task] = "preprocess_wait"
                 task.add_done_callback(release_file)
                 app.state.file_tasks.add(task)
                 tasks.append(task)
