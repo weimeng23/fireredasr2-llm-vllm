@@ -117,12 +117,18 @@ def main():
         HEALTH_PORT_FILE.write_text(str(port), encoding="ascii")
         log_command(command)
         os.execvp(command[0], command)
+    try:
+        workers = int(os.getenv("GATEWAY_WORKERS", "1"))
+    except ValueError:
+        raise ValueError("GATEWAY_WORKERS must be a positive integer") from None
+    if workers <= 0:
+        raise ValueError("GATEWAY_WORKERS must be a positive integer")
     backend = build_command(host="127.0.0.1", port=8001)
     HEALTH_PORT_FILE.write_text(str(port), encoding="ascii")
     gateway_env = dict(os.environ, BACKEND_URL="http://127.0.0.1:8001")
     gateway_python = os.getenv("GATEWAY_PYTHON", "/opt/gateway-venv/bin/python")
     gateway = [gateway_python, "-m", "uvicorn", "gateway.app:app",
-               "--host", "0.0.0.0", "--port", str(port), "--workers", "1",
+               "--host", "0.0.0.0", "--port", str(port), "--workers", str(workers),
                "--timeout-graceful-shutdown", str(max(1, int(shutdown) - 2))]
     log_command(backend)
     return supervise(backend, gateway, gateway_env=gateway_env,
